@@ -1053,7 +1053,7 @@ window.PORTAL_CONFIG = {
       </div>
       <div class="flex gap-2 mt-4" x-show="!hasBakedConfig">
         <button class="btn btn-ghost" @click="testGistSync()">Test Connection</button>
-        <button class="btn btn-accent" @click="syncFromGist()" :disabled="!settings.gistId || !settings.githubToken">Pull from Gist</button>
+        <button class="btn btn-accent" @click="syncFromGist()" :disabled="!settings.gistId">Pull from Gist</button>
         <button class="btn btn-accent" @click="syncToGist()" :disabled="!settings.gistId || !settings.githubToken">Push to Gist</button>
       </div>
       <div class="text-xs mt-2" :class="syncMessage.includes('Error')?'text-red-700':'text-ink-500'" x-text="syncMessage"></div>
@@ -1863,7 +1863,7 @@ function portal() {
 
       await this.loadFromStorage();
 
-      if (this.settings.gistId && this.settings.githubToken) {
+      if (this.settings.gistId) {
         await this.syncFromGist(true);
         this.startPolling();
       } else if (this.data.positions.length === 0) {
@@ -1912,7 +1912,7 @@ function portal() {
         this.encryptionEnabled = true;
         this.lockInput = '';
         this.isLocked = false;
-        if (this.settings.gistId && this.settings.githubToken) {
+        if (this.settings.gistId) {
           await this.syncFromGist(true);
           this.startPolling();
         }
@@ -2120,15 +2120,34 @@ function portal() {
     saveSettings() { this.saveToStorage(); this.startPolling(); },
 
     // =================== GIST SYNC ===================
+    async fetchGistForRead() {
+      this._usedAnonymousGistRead = false;
+      const headers = { 'Accept': 'application/vnd.github+json' };
+      if (this.settings.githubToken) {
+        headers.Authorization = `token ${this.settings.githubToken}`;
+      }
+
+      let res = await fetch(`https://api.github.com/gists/${this.settings.gistId}`, { headers });
+      if ((res.status === 401 || res.status === 403) && this.settings.githubToken) {
+        // The data file is encrypted, and secret Gists can still be read by URL.
+        // If the baked token expires or loses access, keep the portal readable.
+        res = await fetch(`https://api.github.com/gists/${this.settings.gistId}`, {
+          headers: { 'Accept': 'application/vnd.github+json' }
+        });
+        if (res.ok) {
+          this._usedAnonymousGistRead = true;
+        }
+      }
+      return res;
+    },
+
     async syncFromGist(silent=false) {
-      if (!this.settings.gistId || !this.settings.githubToken) {
-        if (!silent) { this.syncMessage='Error: Gist ID and token required.'; this.syncMode='error'; }
+      if (!this.settings.gistId) {
+        if (!silent) { this.syncMessage='Error: Gist ID required.'; this.syncMode='error'; }
         return;
       }
       try {
-        const res = await fetch(`https://api.github.com/gists/${this.settings.gistId}`, {
-          headers: { 'Authorization': `token ${this.settings.githubToken}`, 'Accept': 'application/vnd.github+json' }
-        });
+        const res = await this.fetchGistForRead();
         if (!res.ok) throw new Error(`Gist fetch failed: ${res.status}`);
         const gist = await res.json();
         const file = gist.files['recruitment-data.json'] || Object.values(gist.files)[0];
@@ -2157,7 +2176,9 @@ function portal() {
         this.hasUnsavedChanges = false;
         this.remoteHasNewer = false;
         this.syncMode = 'gist';
-        this.syncMessage = silent ? '' : `Synced from Gist at ${new Date().toLocaleTimeString()}`;
+        this.syncMessage = this._usedAnonymousGistRead
+          ? 'Read-only sync: GitHub token was rejected; data loaded anonymously.'
+          : (silent ? '' : `Synced from Gist at ${new Date().toLocaleTimeString()}`);
         await this._persistLocal();
         setTimeout(()=>this.renderCharts(), 100);
       } catch(e) {
@@ -2170,9 +2191,7 @@ function portal() {
       if (!this.settings.gistId || !this.settings.githubToken || this.isReadOnly) return;
       try {
         if (!force && this.lastSyncedAt) {
-          const check = await fetch(`https://api.github.com/gists/${this.settings.gistId}`, {
-            headers: { 'Authorization': `token ${this.settings.githubToken}`, 'Accept': 'application/vnd.github+json' }
-          });
+          const check = await this.fetchGistForRead();
           if (check.ok) {
             const meta = await check.json();
             if (meta.updated_at && meta.updated_at !== this.lastSyncedAt) {
@@ -2229,19 +2248,17 @@ function portal() {
     // ---- Polling: every 30s, check if remote has newer data ----
     startPolling() {
       if (this.pollTimer) clearInterval(this.pollTimer);
-      if (!this.settings.gistId || !this.settings.githubToken) return;
+      if (!this.settings.gistId) return;
       // Fire first poll immediately so user sees fresh state, then every 30s
       this.pollRemote();
       this.pollTimer = setInterval(() => this.pollRemote(), 30000);
     },
 
     async pollRemote() {
-      if (!this.settings.gistId || !this.settings.githubToken) return;
+      if (!this.settings.gistId) return;
       this.lastPolledAt = new Date().toISOString();
       try {
-        const res = await fetch(`https://api.github.com/gists/${this.settings.gistId}`, {
-          headers: { 'Authorization': `token ${this.settings.githubToken}`, 'Accept': 'application/vnd.github+json' }
-        });
+        const res = await this.fetchGistForRead();
         if (!res.ok) {
           this.syncMode = 'error';
           this.syncMessage = `Poll failed: ${res.status}`;
@@ -2256,13 +2273,17 @@ function portal() {
           } else {
             // No local changes — safe to auto-pull
             await this.syncFromGist(true);
-            this.syncMessage = `Synced ${new Date().toLocaleTimeString()}`;
+            if (!this._usedAnonymousGistRead) {
+              this.syncMessage = `Synced ${new Date().toLocaleTimeString()}`;
+            }
           }
         }
         // If we got here without errors, sync mode is healthy
         if (this.syncMode === 'error') {
           this.syncMode = 'gist';
-          this.syncMessage = '';
+          this.syncMessage = this._usedAnonymousGistRead
+            ? 'Read-only sync: GitHub token was rejected; data loaded anonymously.'
+            : '';
         }
       } catch(e) {
         // Surface network errors to the UI instead of swallowing
@@ -2273,7 +2294,7 @@ function portal() {
 
     // Force an immediate pull from Gist (user-initiated via sync indicator click)
     async manualSync() {
-      if (!this.settings.gistId || !this.settings.githubToken) {
+      if (!this.settings.gistId) {
         alert('Gist sync is not configured.');
         return;
       }
@@ -2331,13 +2352,12 @@ function portal() {
     async testGistSync() {
       this.syncMessage = 'Testing...';
       if (!this.settings.gistId) { this.syncMessage='Error: Gist ID required.'; return; }
-      if (!this.settings.githubToken) { this.syncMessage='Error: GitHub token required.'; return; }
       try {
-        const res = await fetch(`https://api.github.com/gists/${this.settings.gistId}`, {
-          headers: { 'Authorization': `token ${this.settings.githubToken}`, 'Accept': 'application/vnd.github+json' }
-        });
+        const res = await this.fetchGistForRead();
         if (!res.ok) throw new Error(`Status ${res.status}: ${res.statusText}`);
-        this.syncMessage = '✓ Connection OK. Gist is accessible.';
+        this.syncMessage = (!this.settings.githubToken || this._usedAnonymousGistRead)
+          ? 'Read-only OK. Rotate the GitHub token to push changes.'
+          : '✓ Connection OK. Gist is accessible.';
         this.syncMode = 'gist';
       } catch(e) {
         this.syncMessage = `Error: ${e.message}`;
